@@ -7,8 +7,12 @@ from typing import List, Tuple, Dict
 
 class MaxConcurrentFlowSolver:
     """
-    Solver for maximum concurrent flow problems in undirected networks.
     Finds the maximum flow that all sessions can achieve simultaneously.
+
+    Solving Fractional Multi Commodity Flow is Polynomial Time.
+    However, the print_solution method itself is NP cuz simple path finding.
+    
+    Solving Integral Multi Commodity Flow is NP hard.
     """
     
     def __init__(self, G: nx.Graph, sessions: List[Tuple[int, int]]):
