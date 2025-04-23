@@ -36,6 +36,13 @@ class MaxConcurrentFlowSolver:
         # Extract edge capacities
         self.capacities = np.array([G[u][v].get('capacity', float('inf')) for u, v in self.edges])
         
+        # Create a directed graph for tracking flows (to handle edge directions properly)
+        self.flow_graph = nx.DiGraph()
+        for u, v in self.edges:
+            capacity = G[u][v].get('capacity', float('inf'))
+            self.flow_graph.add_edge(u, v, capacity=capacity)
+            self.flow_graph.add_edge(v, u, capacity=capacity)
+        
         # Initialize results
         self.flows = None
         self.max_concurrent_flow = None
@@ -55,9 +62,8 @@ class MaxConcurrentFlowSolver:
             f[k] = {}
             for i in range(self.num_nodes):
                 f[k][i] = {}
-                for j in range(self.num_nodes):
-                    if self.G.has_edge(i, j):
-                        f[k][i][j] = cp.Variable(nonneg=True)
+                for j in self.G.neighbors(i):
+                    f[k][i][j] = cp.Variable(nonneg=True)
         
         # Create variable for the maximum concurrent flow
         # This represents how much flow each session can carry
@@ -112,8 +118,20 @@ class MaxConcurrentFlowSolver:
         self.flows = {}
         for k in range(self.num_commodities):
             self.flows[k] = {}
-            for u, v in self.edges:
-                self.flows[k][(u, v)] = f[k][u][v].value
+            for u in range(self.num_nodes):
+                for v in self.G.neighbors(u):
+                    if (u, v) not in self.flows[k]:
+                        # Get the flow values in both directions
+                        forward_flow = f[k][u][v].value
+                        backward_flow = f[k][v][u].value if v in f[k] and u in f[k][v] else 0
+                        
+                        # Calculate effective flow (can't have flow in both directions simultaneously)
+                        if forward_flow > backward_flow:
+                            self.flows[k][(u, v)] = forward_flow - backward_flow
+                            self.flows[k][(v, u)] = 0
+                        else:
+                            self.flows[k][(v, u)] = backward_flow - forward_flow
+                            self.flows[k][(u, v)] = 0
         
         return {
             'status': self.status,
@@ -180,35 +198,61 @@ class MaxConcurrentFlowSolver:
         for k, (source, target) in enumerate(self.sessions):
             print(f"\nSession {k}: {source} → {target} (flow: {self.max_concurrent_flow:.4f})")
             
-            # Find all paths with positive flow for this session
-            paths = []
-            visited = set()
-            
-            def find_paths(node, path, remaining_flow):
-                if node == target and remaining_flow > 1e-6:
-                    paths.append((path[:], remaining_flow))
-                    return
+            # Create a directed flow network for this commodity
+            flow_net = nx.DiGraph()
+            for u, v in self.G.edges():
+                flow_uv = self.flows[k].get((u, v), 0)
+                flow_vu = self.flows[k].get((v, u), 0)
                 
-                visited.add(node)
-                for neighbor in self.G.neighbors(node):
-                    edge = (node, neighbor)
-                    flow = self.flows[k].get(edge, 0)
-                    if flow > 1e-6 and neighbor not in visited:
-                        path.append(neighbor)
-                        find_paths(neighbor, path, min(remaining_flow, flow))
-                        path.pop()
-                visited.remove(node)
+                if flow_uv > 1e-6:
+                    flow_net.add_edge(u, v, flow=flow_uv)
+                if flow_vu > 1e-6:
+                    flow_net.add_edge(v, u, flow=flow_vu)
             
-            # Start DFS from source
-            find_paths(source, [source], float('inf'))
-            
-            # Print paths
-            total_session_flow = 0
-            for path, flow in paths:
-                print(f"  Path: {' → '.join(map(str, path))}, Flow: {flow:.4f}")
-                total_session_flow += flow
-            
-            print(f"  Total session flow: {total_session_flow:.4f}")
+            # Find all simple paths from source to target in the flow network
+            try:
+                all_paths = list(nx.all_simple_paths(flow_net, source, target))
+                
+                # Calculate flow for each path
+                path_flows = []
+                remaining_flow = self.max_concurrent_flow
+                
+                for path in all_paths:
+                    if remaining_flow < 1e-6:
+                        break
+                        
+                    # Find the minimum flow on the path
+                    min_flow = float('inf')
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i + 1]
+                        edge_flow = flow_net[u][v].get('flow', 0)
+                        min_flow = min(min_flow, edge_flow)
+                    
+                    # Skip paths with no flow
+                    if min_flow < 1e-6:
+                        continue
+                    
+                    # Adjust for remaining flow
+                    path_flow = min(min_flow, remaining_flow)
+                    path_flows.append((path, path_flow))
+                    remaining_flow -= path_flow
+                    
+                    # Reduce the flow on this path
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i + 1]
+                        flow_net[u][v]['flow'] -= path_flow
+                
+                # Print paths
+                total_session_flow = 0
+                for path, flow in path_flows:
+                    print(f"  Path: {' → '.join(map(str, path))}, Flow: {flow:.4f}")
+                    total_session_flow += flow
+                
+                print(f"  Total session flow: {total_session_flow:.4f}")
+                
+            except nx.NetworkXNoPath:
+                print(f"  No flow path found from {source} to {target}")
+                print(f"  Total session flow: 0.0000")
     
     def visualize_flows(self, figsize=(15, 10)):
         """
@@ -222,37 +266,51 @@ class MaxConcurrentFlowSolver:
             plt.figure(figsize=figsize)
             pos = nx.spring_layout(self.G, seed=42)
             
-            # Create edge colors based on flow values for this session
+            # Create a directed graph for this commodity's flow
+            flow_graph = nx.DiGraph()
+            flow_graph.add_nodes_from(self.G.nodes())
+            
+            # Add edges with flow values
             edge_colors = []
             edge_widths = []
             
-            for u, v in self.edges:
-                # Get the flow in both directions
+            for u, v in self.G.edges():
                 flow_uv = self.flows[k].get((u, v), 0)
                 flow_vu = self.flows[k].get((v, u), 0)
                 
-                # Determine color intensity based on flow
-                net_flow = max(flow_uv, flow_vu)
-                edge_colors.append(net_flow)
-                edge_widths.append(1 + 5 * net_flow / self.max_concurrent_flow if self.max_concurrent_flow > 0 else 1)
+                if flow_uv > 1e-6:
+                    flow_graph.add_edge(u, v, weight=flow_uv)
+                    edge_colors.append(flow_uv)
+                    edge_widths.append(1 + 5 * flow_uv / self.max_concurrent_flow if self.max_concurrent_flow > 0 else 1)
+                
+                if flow_vu > 1e-6:
+                    flow_graph.add_edge(v, u, weight=flow_vu)
+                    edge_colors.append(flow_vu)
+                    edge_widths.append(1 + 5 * flow_vu / self.max_concurrent_flow if self.max_concurrent_flow > 0 else 1)
             
-            # Draw the network
-            nx.draw_networkx_nodes(self.G, pos, node_size=700,
+            # Draw the nodes
+            nx.draw_networkx_nodes(flow_graph, pos, node_size=700,
                                   node_color=['red' if n == source else 'green' if n == target else 'lightblue' 
-                                             for n in self.G.nodes()])
+                                             for n in flow_graph.nodes()])
             
-            # Draw edges with width proportional to flow
-            edges = nx.draw_networkx_edges(self.G, pos, width=edge_widths, edge_color=edge_colors, 
-                                         edge_cmap=plt.cm.Blues, edge_vmin=0, edge_vmax=self.max_concurrent_flow)
-            
-            # Add a colorbar
-            sm = plt.cm.ScalarMappable(cmap=plt.cm.Blues, norm=plt.Normalize(0, self.max_concurrent_flow))
-            sm.set_array([])
-            cbar = plt.colorbar(sm)
-            cbar.set_label('Flow Amount')
+            # Draw the edges with flow
+            if flow_graph.edges():
+                edges = nx.draw_networkx_edges(flow_graph, pos, width=edge_widths, edge_color=edge_colors, 
+                                             edge_cmap=plt.cm.Blues, edge_vmin=0, edge_vmax=self.max_concurrent_flow,
+                                             connectionstyle='arc3,rad=0.1')  # Curved edges for directed
+                
+                # Add a colorbar
+                sm = plt.cm.ScalarMappable(cmap=plt.cm.Blues, norm=plt.Normalize(0, self.max_concurrent_flow))
+                sm.set_array([])
+                cbar = plt.colorbar(sm)
+                cbar.set_label('Flow Amount')
+                
+                # Add edge labels with flow values
+                edge_labels = {(u, v): f"{flow_graph[u][v]['weight']:.2f}" for u, v in flow_graph.edges()}
+                nx.draw_networkx_edge_labels(flow_graph, pos, edge_labels=edge_labels, label_pos=0.3)
             
             # Draw node labels
-            nx.draw_networkx_labels(self.G, pos)
+            nx.draw_networkx_labels(flow_graph, pos)
             
             # Set title
             plt.title(f"Session {k}: {source} → {target} (Flow: {self.max_concurrent_flow:.4f})")
@@ -280,10 +338,10 @@ def run_example():
     
     # Define sessions: (source, target)
     sessions = [
-        (0, 2),  # Session 0: Send flow from node 0 to node 4
+        (0, 2),
         (1, 0),
-        (2,1),
-        (3,4)   # Session 1: Send flow from node 1 to node 3
+        (2, 1),
+        (3, 4)
     ]
     
     # Create and solve the maximum concurrent flow problem
